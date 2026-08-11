@@ -1,0 +1,123 @@
+"""CLOB order-book and fee-rate fetching.
+
+Written for this project (not vendored). The HTTP call itself is injected as
+a `getter` callable so this module reuses paper_trade.py rate limiting,
+retry/back-off and session headers rather than opening a second, untuned
+HTTP path to the same API.
+
+    from execution import books
+    book = books.fetch_order_book(token_id, api_get)
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable
+
+from .models import OrderBook, OrderBookLevel
+
+CLOB_API = "https://clob.polymarket.com"
+BOOK_URL = f"{CLOB_API}/book"
+FEE_RATE_URL = f"{CLOB_API}/fee-rate"
+
+# A getter takes (url, params, label) and returns parsed JSON -- the shape of
+# paper_trade.api_get.
+Getter = Callable[..., Any]
+
+# Fee rates change rarely; the book never gets cached.
+_fee_cache: dict[str, int] = {}
+
+
+def parse_order_book(data: Any) -> OrderBook:
+    """Parse a CLOB /book response into an OrderBook."""
+    if not isinstance(data, dict):
+        return OrderBook()
+
+    def levels(key: str) -> list[OrderBookLevel]:
+        out: list[OrderBookLevel] = []
+        for entry in data.get(key) or []:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                price = float(entry.get("price", 0))
+                size = float(entry.get("size", 0))
+            except (TypeError, ValueError):
+                continue
+            if price > 0 and size > 0:
+                out.append(OrderBookLevel(price=price, size=size))
+        return out
+
+    return OrderBook(bids=levels("bids"), asks=levels("asks"))
+
+
+def fetch_order_book(token_id: str, getter: Getter) -> OrderBook | None:
+    """Live order book for a token, or None if it cannot be fetched.
+
+    None means the book could not be fetched. An empty-but-real book comes
+    back as an OrderBook with no levels -- the caller has to tell those apart,
+    because one is an API blip and the other is a market with no liquidity.
+
+    Never cached -- a stale book would defeat the point of costing the fill.
+    """
+    if not token_id:
+        return None
+    try:
+        data = getter(BOOK_URL, {"token_id": token_id},
+                     label=f"book {token_id[:12]}")
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    return parse_order_book(data)
+
+
+def fetch_fee_rate_bps(token_id: str, getter: Getter, default: int = 0) -> int:
+    """Fee rate in basis points for a token, cached for the process lifetime.
+
+    Polymarket has run most markets at zero taker fees, so `default` is 0 --
+    on those markets the real execution cost is spread plus slippage, not fees.
+    Set a non-zero default to stress-test a fee regime that does not exist yet.
+    """
+    if not token_id:
+        return default
+    if token_id in _fee_cache:
+        return _fee_cache[token_id]
+
+    try:
+        data = getter(FEE_RATE_URL, {"token_id": token_id},
+                      label=f"fee-rate {token_id[:12]}")
+        bps = int((data or {}).get("fee_rate_bps", default))
+    except Exception:
+        bps = default
+
+    _fee_cache[token_id] = bps
+    return bps
+
+
+def best_bid(book: OrderBook) -> float | None:
+    return max((lvl.price for lvl in book.bids), default=None)
+
+
+def best_ask(book: OrderBook) -> float | None:
+    return min((lvl.price for lvl in book.asks), default=None)
+
+
+def midpoint(book: OrderBook) -> float | None:
+    """Mid of best bid and best ask, or None when either side is empty."""
+    bid, ask = best_bid(book), best_ask(book)
+    if bid is None or ask is None:
+        return None
+    return (bid + ask) / 2.0
+
+
+def spread_bps(book: OrderBook) -> float | None:
+    """Quoted spread in basis points of the midpoint."""
+    bid, ask = best_bid(book), best_ask(book)
+    mid = midpoint(book)
+    if bid is None or ask is None or not mid:
+        return None
+    return (ask - bid) / mid * 10_000
+
+
+def clear_fee_cache() -> None:
+    _fee_cache.clear()
