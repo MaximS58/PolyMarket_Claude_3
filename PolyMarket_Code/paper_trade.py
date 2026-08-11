@@ -92,9 +92,19 @@ EXECUTION_COSTS = True
 # is what this strategy would really do -- size down, not walk away.
 ORDER_TYPE = "fak"
 
-# Polymarket has run most markets at zero taker fees. The CLOB fee-rate
-# endpoint is still asked per token; this is only the fallback.
+# Fee rate is read per token from the CLOB /fee-rate endpoint; this is only
+# the fallback when that call fails. Fees are NOT hypothetical: sampling the
+# top-volume active markets, 9 of 12 report base_fee 1000 with feesEnabled
+# true (feeType economics_fees), and only longshots came back 0.
 DEFAULT_FEE_BPS = 0
+
+# UNVERIFIED UNIT. The endpoint reports base_fee as a bare integer (1000) and
+# upstream treats that field as basis points, which makes the charge
+# 0.10 * min(price, 1-price) * shares -- about 10% of notional at a 0.38
+# price. That is steep enough to be worth confirming against a real filled
+# order before trusting the P&L. Set this to a number to pin every market to
+# that rate instead (0 disables fees entirely); leave None to use the API.
+FEE_BPS_OVERRIDE: int | None = None
 
 # Walk away from an entry whose average fill is this far through the midpoint.
 # At that point the book is too thin to trust at this size.
@@ -916,7 +926,8 @@ def _execute_buy(token_id: str, size_usd: float, mid_price: float,
         # The book came back and there is genuinely nothing offered.
         return None
 
-    fee_bps = books.fetch_fee_rate_bps(token_id, api_get, DEFAULT_FEE_BPS)
+    fee_bps = (FEE_BPS_OVERRIDE if FEE_BPS_OVERRIDE is not None
+               else books.fetch_fee_rate_bps(token_id, api_get, DEFAULT_FEE_BPS))
     r = simulate_buy_fill(book, size_usd, fee_bps, order_type=ORDER_TYPE)
 
     if r.total_shares <= 0:
@@ -947,7 +958,8 @@ def _execute_sell(token_id: str, shares: float, mid_price: float,
         # exact liquidity risk this whole module exists to measure.
         return None
 
-    fee_bps = books.fetch_fee_rate_bps(token_id, api_get, DEFAULT_FEE_BPS)
+    fee_bps = (FEE_BPS_OVERRIDE if FEE_BPS_OVERRIDE is not None
+               else books.fetch_fee_rate_bps(token_id, api_get, DEFAULT_FEE_BPS))
     r = simulate_sell_fill(book, shares, fee_bps, order_type=ORDER_TYPE)
 
     if r.total_shares <= 0:

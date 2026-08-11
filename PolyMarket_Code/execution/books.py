@@ -11,6 +11,8 @@ HTTP path to the same API.
 
 from __future__ import annotations
 
+import logging
+
 from typing import Any, Callable
 
 from .models import OrderBook, OrderBookLevel
@@ -74,9 +76,10 @@ def fetch_order_book(token_id: str, getter: Getter) -> OrderBook | None:
 def fetch_fee_rate_bps(token_id: str, getter: Getter, default: int = 0) -> int:
     """Fee rate in basis points for a token, cached for the process lifetime.
 
-    Polymarket has run most markets at zero taker fees, so `default` is 0 --
-    on those markets the real execution cost is spread plus slippage, not fees.
-    Set a non-zero default to stress-test a fee regime that does not exist yet.
+    `default` is only used when the call fails. Most liquid markets currently
+    report base_fee 1000; longshot markets report 0. See the note on
+    FEE_BPS_OVERRIDE in paper_trade.py about that value being an unverified
+    unit -- this function returns whatever the API says, unconverted.
     """
     if not token_id:
         return default
@@ -86,12 +89,40 @@ def fetch_fee_rate_bps(token_id: str, getter: Getter, default: int = 0) -> int:
     try:
         data = getter(FEE_RATE_URL, {"token_id": token_id},
                       label=f"fee-rate {token_id[:12]}")
-        bps = int((data or {}).get("fee_rate_bps", default))
+        bps = _read_fee_bps(data, default)
     except Exception:
         bps = default
 
     _fee_cache[token_id] = bps
     return bps
+
+
+# The live endpoint answers {"base_fee": 0}. Upstream read "fee_rate_bps",
+# which is not a key it returns, so every lookup silently fell through to the
+# default -- right answer today only because Polymarket runs at zero fees
+# (taker_base_fee 0, feesEnabled false). Read the key it actually sends, keep
+# the others as alternates, and say something if none of them appear.
+_FEE_KEYS = ("base_fee", "taker_base_fee", "fee_rate_bps")
+_warned_unknown_schema = [False]
+
+
+def _read_fee_bps(data: Any, default: int) -> int:
+    """Pull the fee rate in bps out of a /fee-rate response."""
+    if not isinstance(data, dict):
+        return default
+    for key in _FEE_KEYS:
+        if key in data:
+            try:
+                return int(data[key])
+            except (TypeError, ValueError):
+                return default
+    if not _warned_unknown_schema[0]:
+        _warned_unknown_schema[0] = True
+        logging.getLogger("paper_trade").warning(
+            "fee-rate response has none of %s (got %s) - assuming %d bps. "
+            "The endpoint schema may have changed.",
+            ", ".join(_FEE_KEYS), sorted(data)[:6], default)
+    return default
 
 
 def best_bid(book: OrderBook) -> float | None:
