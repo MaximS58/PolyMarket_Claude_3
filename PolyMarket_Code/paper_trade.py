@@ -68,7 +68,15 @@ PORTFOLIO_SIZE = 10_000.0
 CASH_RESERVE_PCT = 0.10      # keep 10% free to fund newly-appearing trades
 REFRESH_SECONDS = 30
 RESOLUTION_CHECK_CYCLES = 20  # ~10 min at a 30s refresh
-TIER_TO_TRADE = "High"
+
+# ---- Selection: one pass, at seeding ----
+# Rank the overlaps by the dollars the copied traders have committed, keep
+# the top TOP_BY_VALUE, then open the TRADE_SOONEST of those that resolve
+# first. Nothing is opened after seeding: a position is held until the
+# market resolves or the exit monitor reports the cohort has left.
+TOP_BY_VALUE = 25
+TRADE_SOONEST = 10
+SELECTION_LABEL = "top-value/soonest"
 
 # Live dashboard
 RECENT_ACTIVITY_LINES = 8   # log lines shown at the bottom of the frame
@@ -546,7 +554,9 @@ class Portfolio:
                 "cycles": self.cycles,
                 "starting_capital": self.starting_capital,
                 "per_trade_size": round(self.per_trade_size, 2),
-                "tier_traded": TIER_TO_TRADE,
+                "selection": SELECTION_LABEL,
+                "top_by_value": TOP_BY_VALUE,
+                "trade_soonest": TRADE_SOONEST,
             },
             "summary": {
                 "equity": round(self.equity, 2),
@@ -650,42 +660,137 @@ def build_cohort_index(overlaps: dict, top_traders: dict) -> dict[tuple[str, str
     return index
 
 
+def _parse_iso(value: Any) -> datetime | None:
+    """Parse an ISO timestamp, tolerating the string "None" the scraper emits."""
+    if not value or str(value) == "None":
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_money(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def load_candidates() -> list[dict]:
-    """Load High-tier recommendations, enriched with token id and trader cohort."""
-    for path in (RECOMMENDED_TRADES_FILE, TOP_TRADERS_FILE, OVERLAPS_FILE):
+    """
+    Choose the book in one pass: rank the overlaps by the dollars the copied
+    traders have committed, keep the top TOP_BY_VALUE, then open the
+    TRADE_SOONEST of those that resolve first.
+
+    Ranking on total_value rather than share count is deliberate. A sub-cent
+    market routinely shows half a million shares for a couple of hundred
+    dollars, and ranking by size would let those crowd out every position with
+    real money behind it.
+    """
+    for path in (TOP_TRADERS_FILE, OVERLAPS_FILE):
         if not path.exists():
             log.error("Required file not found: %s", path)
             log.error("Run the pipeline first:  python run_all.py")
             sys.exit(1)
 
-    recommended = _load_json(RECOMMENDED_TRADES_FILE)
     top_traders = _load_json(TOP_TRADERS_FILE)
     overlaps = _load_json(OVERLAPS_FILE)
 
     token_index = build_token_index(top_traders)
     cohort_index = build_cohort_index(overlaps, top_traders)
 
-    candidates = []
-    for trade in recommended.get("trades", []):
-        if trade.get("tier") != TIER_TO_TRADE:
-            continue
-        key = (trade.get("condition_id", ""), trade.get("outcome_to_buy", ""))
+    now = datetime.now(timezone.utc)
+    pool: list[dict] = []
+    dropped = {"under_way": 0, "no_end_date": 0, "no_token": 0, "no_cohort": 0}
 
+    for group in overlaps.get("overlaps", []):
+        # Never enter a market already under way or settled.
+        state = group.get("market_state")
+        if state is not None and state != "upcoming":
+            dropped["under_way"] += 1
+            continue
+
+        end_date = _parse_iso(group.get("end_date"))
+        if end_date is None or end_date <= now:
+            # No end date means it cannot be ranked by "resolving soonest".
+            dropped["no_end_date"] += 1
+            continue
+
+        key = (group.get("condition_id", ""), group.get("outcome", ""))
         token_id = token_index.get(key)
         if not token_id:
-            log.warning("No token id for %s (%s) — skipping.",
-                        trade.get("market_title", "?")[:50], trade.get("outcome_to_buy"))
+            dropped["no_token"] += 1
             continue
 
         cohort = cohort_index.get(key, [])
         if not cohort:
-            log.warning("No trader cohort for %s — skipping (nothing to follow out).",
-                        trade.get("market_title", "?")[:50])
+            # No cohort means no one to follow back out of the trade.
+            dropped["no_cohort"] += 1
             continue
 
-        candidates.append({**trade, "token_id": token_id, "cohort": cohort})
+        pool.append({
+            "condition_id": group.get("condition_id", ""),
+            "token_id": token_id,
+            "market_title": group.get("market_title", ""),
+            "slug": group.get("slug", ""),
+            "outcome_to_buy": group.get("outcome", ""),
+            "current_price": _as_money(group.get("cur_price")),
+            "cohort_value_usd": _as_money(group.get("total_value")),
+            "end_date": group.get("end_date"),
+            "days_to_expiry": (end_date - now).days,
+            "cohort": cohort,
+            "conviction_score": len(cohort),
+            "tier": SELECTION_LABEL,
+        })
 
-    return candidates
+    log.info("Overlaps: %d read, %d eligible  (dropped %d under way, "
+             "%d no end date, %d no token id, %d no cohort)",
+             len(overlaps.get("overlaps", [])), len(pool), dropped["under_way"],
+             dropped["no_end_date"], dropped["no_token"], dropped["no_cohort"])
+
+    # One side per market. The overlaps file lists each outcome separately, so
+    # a market where the cohort is split shows up twice -- and buying both Over
+    # at 0.62 and Under at 0.38 pays $1.00 for $1.00 back, minus two spreads and
+    # two fees. Worse, open_positions is keyed by condition_id, so the second
+    # fill would overwrite the first: cash gone twice, one position tracked.
+    # Keep whichever side the cohort has more money on.
+    best_side: dict[str, dict] = {}
+    for candidate in pool:
+        cid = candidate["condition_id"]
+        incumbent = best_side.get(cid)
+        if incumbent is None or candidate["cohort_value_usd"] > incumbent["cohort_value_usd"]:
+            best_side[cid] = candidate
+    contested = len(pool) - len(best_side)
+    if contested:
+        log.info("Dropped %d opposing side(s) - the cohort is split on those markets.",
+                 contested)
+
+    by_value = sorted(best_side.values(), key=lambda c: c["cohort_value_usd"],
+                      reverse=True)[:TOP_BY_VALUE]
+    chosen = sorted(by_value, key=lambda c: c["end_date"])[:TRADE_SOONEST]
+
+    if by_value:
+        log.info("Top %d by cohort money: $%s at the top, $%s at the cut",
+                 len(by_value), "{:,.0f}".format(by_value[0]["cohort_value_usd"]),
+                 "{:,.0f}".format(by_value[-1]["cohort_value_usd"]))
+
+    # Equal weight: nothing is opened after seeding, so there is no reason to
+    # hold anything back beyond the standing cash reserve.
+    investable = PORTFOLIO_SIZE * (1 - CASH_RESERVE_PCT)
+    per_trade = investable / len(chosen) if chosen else 0.0
+    for candidate in chosen:
+        candidate["recommended_trade_amount_usd"] = per_trade
+
+    log.info("Trading the %d resolving soonest, $%s each:",
+             len(chosen), "{:,.2f}".format(per_trade))
+    for i, c in enumerate(chosen, 1):
+        log.info("  %2d. %-42s %-14s %4dd  $%-12s %d traders", i,
+                 c["market_title"][:42], c["outcome_to_buy"][:14],
+                 c["days_to_expiry"], "{:,.0f}".format(c["cohort_value_usd"]),
+                 c["conviction_score"])
+
+    return chosen
 
 
 # ════════════════════════════════ PRICE FEED ══════════════════════════════════
@@ -932,6 +1037,19 @@ def _execute_buy(token_id: str, size_usd: float, mid_price: float,
 
     if r.total_shares <= 0:
         return None
+
+    # simulate_buy_fill spends the whole notional on shares and adds the fee on
+    # top, so a $900 order actually costs $900 + fee. Budget size_usd as the
+    # all-in number instead: shrink the notional by the fee ratio the first
+    # pass measured, then fill again. One correction is enough -- avg_price
+    # barely moves for a few percent less size.
+    if r.fee > 0:
+        all_in = r.total_cost + r.fee
+        if all_in > size_usd:
+            adjusted = simulate_buy_fill(book, size_usd * (size_usd / all_in),
+                                         fee_bps, order_type=ORDER_TYPE)
+            if adjusted.total_shares > 0:
+                r = adjusted
     if r.slippage_bps > MAX_ENTRY_SLIPPAGE_BPS:
         log.warning("    entry slippage %.0f bps exceeds the %.0f bps limit",
                     r.slippage_bps, MAX_ENTRY_SLIPPAGE_BPS)
@@ -1139,10 +1257,10 @@ def triage_candidates(candidates: list[dict], dry_run: bool) -> tuple[list, list
 def seed_positions(portfolio: Portfolio, candidates: list[dict], dry_run: bool) -> None:
     """Open the initial book, scaled to fit the portfolio's investable capital."""
     if not candidates:
-        log.warning("No High-tier candidates to trade.")
+        log.warning("No candidates to trade - the overlap file yielded none.")
         return
 
-    log.info("Pricing %d %s-tier candidates…", len(candidates), TIER_TO_TRADE)
+    log.info("Pricing %d selected candidates…", len(candidates))
     tradeable, resolved, unpriceable = triage_candidates(candidates, dry_run)
 
     for candidate, detail in resolved:
@@ -1154,8 +1272,8 @@ def seed_positions(portfolio: Portfolio, candidates: list[dict], dry_run: bool) 
                     candidate.get("market_title", "?")[:46], reason)
 
     if not tradeable:
-        log.error("None of the %d %s-tier recommendations are still tradeable.",
-                  len(candidates), TIER_TO_TRADE)
+        log.error("None of the %d selected markets are still tradeable.",
+                  len(candidates))
         log.error("The pipeline output has gone stale — refresh it first:")
         log.error("    python run_all.py")
         return
@@ -1183,34 +1301,6 @@ def seed_positions(portfolio: Portfolio, candidates: list[dict], dry_run: bool) 
         log.warning("%d of %d recommendations had already resolved — "
                     "re-run `python run_all.py` for a fresh set.",
                     len(resolved), len(candidates))
-
-
-def add_new_candidates(portfolio: Portfolio, candidates: list[dict], dry_run: bool) -> None:
-    """Open any High trade that has appeared since the book was built."""
-    closed_ids = {x.condition_id for x in portfolio.closed_positions}
-    fresh = [
-        c for c in candidates
-        if c["condition_id"] not in portfolio.open_positions
-        and c["condition_id"] not in closed_ids
-        and c["condition_id"] not in portfolio.dead_markets  # resolved before we entered
-    ]
-    if not fresh:
-        return
-
-    tradeable, resolved, _ = triage_candidates(fresh, dry_run)
-    for candidate, _detail in resolved:
-        # Remember it so we never spend another request pricing a settled market
-        portfolio.dead_markets.add(candidate["condition_id"])
-
-    for candidate, price in tradeable:
-        size = min(portfolio.per_trade_size or 0.0, portfolio.cash)
-        if size <= 0:
-            log.info("New trade %s found but no cash to fund it.",
-                     candidate.get("market_title", "?")[:50])
-            continue
-
-        log.info("New %s-tier trade detected:", TIER_TO_TRADE)
-        open_position(portfolio, candidate, price, size, dry_run)
 
 
 # ══════════════════════════════════ CYCLE ═════════════════════════════════════
@@ -1261,15 +1351,7 @@ def run_cycle(portfolio: Portfolio, dry_run: bool) -> None:
             position.last_price = price
             position.last_price_at = stamp
 
-    # ── 4. Pick up newly recommended trades ──
-    try:
-        add_new_candidates(portfolio, load_candidates(), dry_run)
-    except SystemExit:
-        raise
-    except Exception:
-        log.exception("Could not check for new recommendations — continuing.")
-
-    # ── 5. Report & persist ──
+    # ── 4. Report & persist ──
     print_dashboard(portfolio)
     append_equity_snapshot(portfolio)
     portfolio.save()
@@ -1444,7 +1526,8 @@ def run() -> None:
 
     portfolio = None if args.reset else Portfolio.load()
     if portfolio is None:
-        log.info("Building a new portfolio from %s trades…", TIER_TO_TRADE)
+        log.info("Selecting the book: top %d by cohort money, "
+                 "then the %d resolving soonest…", TOP_BY_VALUE, TRADE_SOONEST)
         portfolio = Portfolio()
         seed_positions(portfolio, load_candidates(), args.dry_run)
         portfolio.save()
