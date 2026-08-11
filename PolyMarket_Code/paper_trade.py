@@ -114,6 +114,17 @@ DEFAULT_FEE_BPS = 0
 # that rate instead (0 disables fees entirely); leave None to use the API.
 FEE_BPS_OVERRIDE: int | None = None
 
+# A flat percentage of the trade value, charged on the way in and again on
+# the way out. Simpler and far easier to reason about than the per-market
+# rate above, which varies with how close the price sits to 50c.
+#
+# Resolution is settlement, not a trade, so a position held to the end pays
+# once. Selling early is what costs you twice.
+#
+# Set to None to fall back to the Polymarket rate (FEE_BPS_OVERRIDE, then the
+# live /fee-rate endpoint). When this is set it wins over both.
+FLAT_FEE_PCT: float | None = 5.0
+
 # Walk away from an entry whose average fill is this far through the midpoint.
 # At that point the book is too thin to trust at this size.
 MAX_ENTRY_SLIPPAGE_BPS = 500.0
@@ -1031,32 +1042,41 @@ def _execute_buy(token_id: str, size_usd: float, mid_price: float,
         # The book came back and there is genuinely nothing offered.
         return None
 
-    fee_bps = (FEE_BPS_OVERRIDE if FEE_BPS_OVERRIDE is not None
-               else books.fetch_fee_rate_bps(token_id, api_get, DEFAULT_FEE_BPS))
-    r = simulate_buy_fill(book, size_usd, fee_bps, order_type=ORDER_TYPE)
+    if FLAT_FEE_PCT is not None:
+        # size_usd is the all-in budget, so solve for the notional exactly:
+        #   notional + notional * pct = size_usd
+        # No second pass needed, unlike the per-share formula below.
+        notional = size_usd / (1.0 + FLAT_FEE_PCT / 100.0)
+        r = simulate_buy_fill(book, notional, 0, order_type=ORDER_TYPE)
+        if r.total_shares <= 0:
+            return None
+        fee = r.total_cost * FLAT_FEE_PCT / 100.0
+    else:
+        fee_bps = (FEE_BPS_OVERRIDE if FEE_BPS_OVERRIDE is not None
+                   else books.fetch_fee_rate_bps(token_id, api_get, DEFAULT_FEE_BPS))
+        r = simulate_buy_fill(book, size_usd, fee_bps, order_type=ORDER_TYPE)
+        if r.total_shares <= 0:
+            return None
 
-    if r.total_shares <= 0:
-        return None
-
-    # simulate_buy_fill spends the whole notional on shares and adds the fee on
-    # top, so a $900 order actually costs $900 + fee. Budget size_usd as the
-    # all-in number instead: shrink the notional by the fee ratio the first
-    # pass measured, then fill again. One correction is enough -- avg_price
-    # barely moves for a few percent less size.
-    if r.fee > 0:
-        all_in = r.total_cost + r.fee
-        if all_in > size_usd:
-            adjusted = simulate_buy_fill(book, size_usd * (size_usd / all_in),
-                                         fee_bps, order_type=ORDER_TYPE)
+        # simulate_buy_fill spends the whole notional on shares and adds the
+        # fee on top, so a $900 order actually costs $900 + fee. Budget
+        # size_usd as the all-in number instead: shrink the notional by the
+        # fee ratio the first pass measured, then fill again. One correction
+        # is enough -- avg_price barely moves for a few percent less size.
+        if r.fee > 0 and r.total_cost + r.fee > size_usd:
+            adjusted = simulate_buy_fill(
+                book, size_usd * (size_usd / (r.total_cost + r.fee)),
+                fee_bps, order_type=ORDER_TYPE)
             if adjusted.total_shares > 0:
                 r = adjusted
+        fee = r.fee
     if r.slippage_bps > MAX_ENTRY_SLIPPAGE_BPS:
         log.warning("    entry slippage %.0f bps exceeds the %.0f bps limit",
                     r.slippage_bps, MAX_ENTRY_SLIPPAGE_BPS)
         return None
 
-    return ExecutedFill(r.total_shares, r.avg_price, r.total_cost + r.fee,
-                        r.fee, r.slippage_bps, r.levels_filled, r.is_partial)
+    return ExecutedFill(r.total_shares, r.avg_price, r.total_cost + fee,
+                        fee, r.slippage_bps, r.levels_filled, r.is_partial)
 
 
 def _execute_sell(token_id: str, shares: float, mid_price: float,
@@ -1076,15 +1096,21 @@ def _execute_sell(token_id: str, shares: float, mid_price: float,
         # exact liquidity risk this whole module exists to measure.
         return None
 
-    fee_bps = (FEE_BPS_OVERRIDE if FEE_BPS_OVERRIDE is not None
-               else books.fetch_fee_rate_bps(token_id, api_get, DEFAULT_FEE_BPS))
-    r = simulate_sell_fill(book, shares, fee_bps, order_type=ORDER_TYPE)
+    if FLAT_FEE_PCT is not None:
+        r = simulate_sell_fill(book, shares, 0, order_type=ORDER_TYPE)
+        if r.total_shares <= 0:
+            return None
+        fee = r.total_cost * FLAT_FEE_PCT / 100.0
+    else:
+        fee_bps = (FEE_BPS_OVERRIDE if FEE_BPS_OVERRIDE is not None
+                   else books.fetch_fee_rate_bps(token_id, api_get, DEFAULT_FEE_BPS))
+        r = simulate_sell_fill(book, shares, fee_bps, order_type=ORDER_TYPE)
+        if r.total_shares <= 0:
+            return None
+        fee = r.fee
 
-    if r.total_shares <= 0:
-        return None
-
-    return ExecutedFill(r.total_shares, r.avg_price, r.total_cost - r.fee,
-                        r.fee, r.slippage_bps, r.levels_filled, r.is_partial)
+    return ExecutedFill(r.total_shares, r.avg_price, r.total_cost - fee,
+                        fee, r.slippage_bps, r.levels_filled, r.is_partial)
 
 
 def _charge(portfolio: Portfolio, fill: ExecutedFill, mid_price: float) -> None:

@@ -132,7 +132,15 @@ def test_open_position_pays_up() -> None:
     print("\nopen_position books the real fill, not the quote")
     _stub_book(TYPICAL)
     p = pt.Portfolio(starting_capital=1000.0, cash=1000.0)
-    pt.open_position(p, CANDIDATE, price=0.50, size_usd=51.0)
+    # Fees off here: this test is about what the spread costs, and a fee
+    # on top would only muddy the arithmetic. test_flat_fee_both_legs
+    # covers the fee behaviour.
+    original = pt.FLAT_FEE_PCT
+    try:
+        pt.FLAT_FEE_PCT = None
+        pt.open_position(p, CANDIDATE, price=0.50, size_usd=51.0)
+    finally:
+        pt.FLAT_FEE_PCT = original
 
     pos = p.open_positions["0xtest"]
     check("entry is the ask", pos.entry_price, 0.51)
@@ -212,6 +220,44 @@ def test_old_portfolio_still_loads() -> None:
     check("slippage defaults to zero", pos.entry_slippage_bps, 0.0)
 
 
+def test_flat_fee_both_legs() -> None:
+    print("\nflat fee: 5% in, another 5% out, nothing on settlement")
+    flat = book(bids=[(0.50, 100000)], asks=[(0.50, 100000)])
+    _stub_book(flat)
+
+    buy = pt._execute_buy("tok", 900.0, 0.50, False)
+    check("all-in equals the budget", round(buy.cash, 2), 900.0)
+    check("fee is 5% of the share cost",
+          round(buy.fee / (buy.cash - buy.fee) * 100, 4), 5.0)
+
+    sell = pt._execute_sell("tok", buy.shares, 0.50, False)
+    check("exit charges 5% too",
+          round(sell.fee / (sell.cash + sell.fee) * 100, 4), 5.0)
+    check("round trip costs both fees", round(900.0 - sell.cash, 2), 85.71)
+
+    # Holding to resolution must only ever pay the entry fee.
+    p = pt.Portfolio(starting_capital=10_000.0, cash=10_000.0)
+    pt.open_position(p, CANDIDATE, price=0.50, size_usd=900.0)
+    pt.close_position(p, p.open_positions["0xtest"], 1.0, "resolved", "won")
+    closed = p.closed_positions[-1]
+    check("entry fee charged", round(closed.entry_fee, 2), 42.86)
+    check("settlement is free", closed.exit_fee, 0.0)
+
+
+def test_flat_fee_can_be_switched_off() -> None:
+    print("\nFLAT_FEE_PCT None falls back to the Polymarket rate")
+    flat = book(bids=[(0.50, 100000)], asks=[(0.50, 100000)])
+    _stub_book(flat, fee_bps=0)
+    original = pt.FLAT_FEE_PCT
+    try:
+        pt.FLAT_FEE_PCT = None
+        buy = pt._execute_buy("tok", 900.0, 0.50, False)
+        check("no flat fee applied", buy.fee, 0.0)
+        check("whole budget bought shares", round(buy.cash, 2), 900.0)
+    finally:
+        pt.FLAT_FEE_PCT = original
+
+
 def main() -> int:
     print("=" * 72)
     print("  EXECUTION COST TESTS  (synthetic books, no network)")
@@ -222,7 +268,9 @@ def main() -> int:
                test_round_trip_costs_money, test_thin_book_partial_fill,
                test_open_position_pays_up, test_resolution_skips_the_book,
                test_partial_exit_keeps_the_remainder, test_no_bid_means_no_exit,
-               test_old_portfolio_still_loads):
+               test_old_portfolio_still_loads,
+               test_flat_fee_both_legs,
+               test_flat_fee_can_be_switched_off):
         fn()
 
     print("\n" + "=" * 72)
