@@ -71,11 +71,14 @@ RESOLUTION_CHECK_CYCLES = 20  # ~10 min at a 30s refresh
 
 # ---- Selection: one pass, at seeding ----
 # Rank the overlaps by the dollars the copied traders have committed, keep
-# the top TOP_BY_LIQUIDITY, then open the TRADE_SOONEST of those that resolve
-# first. Nothing is opened after seeding: a position is held until the
+# the top TOP_BY_LIQUIDITY, then open the TRADE_MOST_EXPENSIVE of those.
+# Nothing is opened after seeding: a position is held until the
 # market resolves or the exit monitor reports the cohort has left.
+# Depth decides which markets are tradeable at all; price decides which of
+# those to actually buy. Keeping the funnel two-stage means the expensive
+# picks still have to clear the book first.
 TOP_BY_LIQUIDITY = 25
-TRADE_SOONEST = 10
+TRADE_MOST_EXPENSIVE = 10
 
 # ---- Liquidity ----
 # The book is asked how much is actually resting there, rather than
@@ -95,7 +98,7 @@ MIN_TRADEABLE_DEPTH_USD = 2_000.0
 # this many consecutive failures and rank on cohort money instead -- the
 # entry-time slippage guard still refuses anything genuinely untradeable.
 LIQUIDITY_ABORT_AFTER = 8
-SELECTION_LABEL = "top-liquidity/soonest"
+SELECTION_LABEL = "top-liquidity/most-expensive"
 
 # When the cohort is split across both sides of a market, one side has to be
 # ahead by more than this in committed dollars for the split to count as a
@@ -112,9 +115,17 @@ DASHBOARD_MAX_WIDTH = 118   # full-width layout, as before
 # Ignore exit signals older than this — a dead monitor must not drive decisions
 MAX_SIGNAL_AGE_SECONDS = 1800
 
-# Refuse to open a position outside this band (effectively resolved / illiquid)
-MIN_TRADEABLE_PRICE = 0.01
-MAX_TRADEABLE_PRICE = 0.99
+# Refuse to open a position outside this band.
+#
+# The floor keeps out lottery tickets, which is also where the book is
+# thinnest -- those were round-tripping at 12-14%.
+#
+# The ceiling matters more than it looks. At 85c a winner pays 17.6%, and
+# roughly 6% of that goes on fees and spread. Push to 95c and the most you
+# can make is 5.3%, less than the cost of getting in and out: the trade
+# cannot pay even when it wins.
+MIN_TRADEABLE_PRICE = 0.05
+MAX_TRADEABLE_PRICE = 0.85
 
 # ---- Execution costs ----
 # Fills walk the live order book instead of transacting at the midpoint, so a
@@ -593,7 +604,7 @@ class Portfolio:
                 "per_trade_size": round(self.per_trade_size, 2),
                 "selection": SELECTION_LABEL,
                 "top_by_liquidity": TOP_BY_LIQUIDITY,
-                "trade_soonest": TRADE_SOONEST,
+                "trade_most_expensive": TRADE_MOST_EXPENSIVE,
                 "liquidity_band_bps": LIQUIDITY_BAND_BPS,
                 "min_depth_usd": MIN_TRADEABLE_DEPTH_USD,
             },
@@ -738,7 +749,7 @@ def _measure_liquidity(candidates: list[dict]) -> list[dict]:
              len(shortlist), LIQUIDITY_BAND_BPS)
 
     liquid: list[dict] = []
-    no_book = too_thin = 0
+    no_book = too_thin = out_of_band = 0
     consecutive_failures = 0
 
     for i, candidate in enumerate(shortlist, 1):
@@ -764,13 +775,23 @@ def _measure_liquidity(candidates: list[dict]) -> list[dict]:
             too_thin += 1
             continue
 
+        # The recorded price came from whenever the pipeline last ran; this is
+        # the live one, and it is what the buy will actually be priced against.
+        mid = books.midpoint(book) or 0.0
+        if not (MIN_TRADEABLE_PRICE <= mid <= MAX_TRADEABLE_PRICE):
+            out_of_band += 1
+            continue
+
+        candidate["mid_price"] = mid
         candidate["depth_usd"] = depth
         candidate["spread_bps"] = books.spread_bps(book) or 0.0
         liquid.append(candidate)
 
-    log.info("Tradeable: %d of %d  (dropped %d unreadable, %d thinner than $%s)",
+    log.info("Tradeable: %d of %d  (dropped %d unreadable, %d thinner than $%s, "
+             "%d outside %.0f-%.0fc on the live price)",
              len(liquid), len(shortlist), no_book, too_thin,
-             "{:,.0f}".format(MIN_TRADEABLE_DEPTH_USD))
+             "{:,.0f}".format(MIN_TRADEABLE_DEPTH_USD), out_of_band,
+             MIN_TRADEABLE_PRICE * 100, MAX_TRADEABLE_PRICE * 100)
     return liquid
 
 
@@ -815,8 +836,12 @@ def _pick_side(group: list[dict]) -> dict | None:
 def load_candidates(measure_liquidity: bool = True) -> list[dict]:
     """
     Choose the book in one pass: measure real order-book depth, keep the
-    TOP_BY_LIQUIDITY deepest, then open the TRADE_SOONEST of those that
-    resolve first.
+    TOP_BY_LIQUIDITY deepest, then open the TRADE_MOST_EXPENSIVE of those.
+
+    Depth decides what is tradeable; price decides what to buy. Both bounds
+    matter: below MIN_TRADEABLE_PRICE the book is too thin to trade, and
+    above MAX_TRADEABLE_PRICE the winnings no longer cover the cost of
+    winning.
 
     Cohort money still narrows the field before the books are read -- see
     _measure_liquidity -- but it no longer decides the ranking. What the
@@ -838,7 +863,8 @@ def load_candidates(measure_liquidity: bool = True) -> list[dict]:
 
     now = datetime.now(timezone.utc)
     pool: list[dict] = []
-    dropped = {"under_way": 0, "no_end_date": 0, "no_token": 0, "no_cohort": 0}
+    dropped = {"under_way": 0, "no_end_date": 0, "out_of_band": 0,
+               "no_token": 0, "no_cohort": 0}
 
     for group in overlaps.get("overlaps", []):
         # Never enter a market already under way or settled.
@@ -849,8 +875,16 @@ def load_candidates(measure_liquidity: bool = True) -> list[dict]:
 
         end_date = _parse_iso(group.get("end_date"))
         if end_date is None or end_date <= now:
-            # No end date means it cannot be ranked by "resolving soonest".
+            # No end date means the market cannot be sanity-checked for expiry.
             dropped["no_end_date"] += 1
+            continue
+
+        # Cheap first pass on the price the pipeline recorded. The live
+        # midpoint is checked again once the book is read; this only avoids
+        # spending a request on a market that is plainly out of band.
+        recorded = _as_money(group.get("cur_price"))
+        if not (MIN_TRADEABLE_PRICE <= recorded <= MAX_TRADEABLE_PRICE):
+            dropped["out_of_band"] += 1
             continue
 
         key = (group.get("condition_id", ""), group.get("outcome", ""))
@@ -880,10 +914,12 @@ def load_candidates(measure_liquidity: bool = True) -> list[dict]:
             "tier": SELECTION_LABEL,
         })
 
-    log.info("Overlaps: %d read, %d eligible  (dropped %d under way, "
-             "%d no end date, %d no token id, %d no cohort)",
+    log.info("Overlaps: %d read, %d eligible  (dropped %d under way, %d no end "
+             "date, %d outside %.0f-%.0fc, %d no token id, %d no cohort)",
              len(overlaps.get("overlaps", [])), len(pool), dropped["under_way"],
-             dropped["no_end_date"], dropped["no_token"], dropped["no_cohort"])
+             dropped["no_end_date"], dropped["out_of_band"],
+             MIN_TRADEABLE_PRICE * 100, MAX_TRADEABLE_PRICE * 100,
+             dropped["no_token"], dropped["no_cohort"])
 
     # One side per market, or none at all. The overlaps file lists each outcome
     # separately, so a market the cohort is split on shows up twice -- and
@@ -949,15 +985,18 @@ def load_candidates(measure_liquidity: bool = True) -> list[dict]:
             for candidate in survivors:
                 candidate.setdefault("depth_usd", candidate["cohort_value_usd"])
                 candidate.setdefault("spread_bps", 0.0)
+                candidate.setdefault("mid_price", candidate["current_price"])
     else:
         # Dry run: no network, so depth is unknown and cohort money stands in.
         for candidate in survivors:
             candidate.setdefault("depth_usd", candidate["cohort_value_usd"])
             candidate.setdefault("spread_bps", 0.0)
+            candidate.setdefault("mid_price", candidate["current_price"])
 
     deepest = sorted(survivors, key=lambda c: c["depth_usd"],
                      reverse=True)[:TOP_BY_LIQUIDITY]
-    chosen = sorted(deepest, key=lambda c: c["end_date"])[:TRADE_SOONEST]
+    chosen = sorted(deepest, key=lambda c: c.get("mid_price", 0.0),
+                    reverse=True)[:TRADE_MOST_EXPENSIVE]
 
     if deepest:
         log.info("Top %d by book depth: $%s at the top, $%s at the cut",
@@ -971,13 +1010,14 @@ def load_candidates(measure_liquidity: bool = True) -> list[dict]:
     for candidate in chosen:
         candidate["recommended_trade_amount_usd"] = per_trade
 
-    log.info("Trading the %d resolving soonest, $%s each:",
+    log.info("Trading the %d most expensive of those, $%s each:",
              len(chosen), "{:,.2f}".format(per_trade))
     for i, c in enumerate(chosen, 1):
-        log.info("  %2d. %-40s %-12s %4dd  depth $%-10s spread %4.0fbps  %d traders",
-                 i, c["market_title"][:40], c["outcome_to_buy"][:12],
-                 c["days_to_expiry"], "{:,.0f}".format(c["depth_usd"]),
-                 c["spread_bps"], c["conviction_score"])
+        price = c.get("mid_price", 0.0)
+        log.info("  %2d. %-38s %-11s %5.1fc  upside %5.1f%%  depth $%-9s %4dd",
+                 i, c["market_title"][:38], c["outcome_to_buy"][:11], price * 100,
+                 (1.0 - price) / price * 100 if price > 0 else 0.0,
+                 "{:,.0f}".format(c["depth_usd"]), c["days_to_expiry"])
 
     return chosen
 
@@ -1731,7 +1771,8 @@ def run() -> None:
     portfolio = None if args.reset else Portfolio.load()
     if portfolio is None:
         log.info("Selecting the book: top %d by cohort money, "
-                 "then the %d resolving soonest…", TOP_BY_LIQUIDITY, TRADE_SOONEST)
+                 "then the %d most expensive…",
+                 TOP_BY_LIQUIDITY, TRADE_MOST_EXPENSIVE)
         portfolio = Portfolio()
         seed_positions(portfolio,
                        load_candidates(measure_liquidity=not args.dry_run),
