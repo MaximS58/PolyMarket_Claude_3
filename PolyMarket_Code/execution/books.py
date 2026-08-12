@@ -150,5 +150,43 @@ def spread_bps(book: OrderBook) -> float | None:
     return (ask - bid) / mid * 10_000
 
 
+def depth_usd_within(book: OrderBook, bps: float, side: str = "ask") -> float:
+    """
+    Dollars resting within `bps` of the midpoint on one side of the book.
+
+    This is the honest measure of whether a market can be traded: not how much
+    the copied cohort staked, and not the headline volume, but how much stock
+    is actually sitting there to hit before the price runs away. Buying more
+    than this figure means walking past the band and paying for it.
+
+    Returns 0.0 when the book has no midpoint (one side empty).
+    """
+    mid = midpoint(book)
+    if not mid or mid <= 0:
+        return 0.0
+
+    limit = mid * (1.0 + bps / 10_000.0) if side == "ask" else mid * (1.0 - bps / 10_000.0)
+    levels = book.asks if side == "ask" else book.bids
+
+    total = 0.0
+    for level in levels:
+        within = level.price <= limit if side == "ask" else level.price >= limit
+        if within:
+            total += level.price * level.size
+    return total
+
+
+def tradeable_depth(book: OrderBook, bps: float) -> float:
+    """
+    The smaller of the two sides' depth within `bps`.
+
+    A position has to be got out of as well as into, so a market with a deep
+    ask and no bid is not tradeable at all -- taking the minimum stops a
+    one-sided book from reading as liquid.
+    """
+    return min(depth_usd_within(book, bps, "ask"),
+               depth_usd_within(book, bps, "bid"))
+
+
 def clear_fee_cache() -> None:
     _fee_cache.clear()

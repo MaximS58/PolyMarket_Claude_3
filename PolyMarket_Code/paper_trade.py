@@ -71,12 +71,31 @@ RESOLUTION_CHECK_CYCLES = 20  # ~10 min at a 30s refresh
 
 # ---- Selection: one pass, at seeding ----
 # Rank the overlaps by the dollars the copied traders have committed, keep
-# the top TOP_BY_VALUE, then open the TRADE_SOONEST of those that resolve
+# the top TOP_BY_LIQUIDITY, then open the TRADE_SOONEST of those that resolve
 # first. Nothing is opened after seeding: a position is held until the
 # market resolves or the exit monitor reports the cohort has left.
-TOP_BY_VALUE = 25
+TOP_BY_LIQUIDITY = 25
 TRADE_SOONEST = 10
-SELECTION_LABEL = "top-value/soonest"
+
+# ---- Liquidity ----
+# The book is asked how much is actually resting there, rather than
+# trusting cohort money as a proxy for tradability. Depth is counted within
+# LIQUIDITY_BAND_BPS of the midpoint, on the thinner of the two sides,
+# because a position has to be got out of as well as into.
+#
+# Measuring costs one request per candidate, so LIQUIDITY_SHORTLIST caps how
+# many are measured -- the field is narrowed by cohort money first. Set it
+# to None to measure every candidate and accept a slower start.
+LIQUIDITY_SHORTLIST = 400
+LIQUIDITY_BAND_BPS = 200.0
+MIN_TRADEABLE_DEPTH_USD = 2_000.0
+
+# Every failed book fetch burns its full retry ladder, so a dead network
+# would otherwise take hours to grind through the shortlist. Give up after
+# this many consecutive failures and rank on cohort money instead -- the
+# entry-time slippage guard still refuses anything genuinely untradeable.
+LIQUIDITY_ABORT_AFTER = 8
+SELECTION_LABEL = "top-liquidity/soonest"
 
 # When the cohort is split across both sides of a market, one side has to be
 # ahead by more than this in committed dollars for the split to count as a
@@ -573,8 +592,10 @@ class Portfolio:
                 "starting_capital": self.starting_capital,
                 "per_trade_size": round(self.per_trade_size, 2),
                 "selection": SELECTION_LABEL,
-                "top_by_value": TOP_BY_VALUE,
+                "top_by_liquidity": TOP_BY_LIQUIDITY,
                 "trade_soonest": TRADE_SOONEST,
+                "liquidity_band_bps": LIQUIDITY_BAND_BPS,
+                "min_depth_usd": MIN_TRADEABLE_DEPTH_USD,
             },
             "summary": {
                 "equity": round(self.equity, 2),
@@ -695,6 +716,64 @@ def _as_money(value: Any) -> float:
         return 0.0
 
 
+def _measure_liquidity(candidates: list[dict]) -> list[dict]:
+    """
+    Attach real order-book depth to each candidate and drop the untradeable.
+
+    Cohort money says how much the copied traders staked. It says nothing about
+    whether anyone will sell to you, which is why the old ranking happily
+    surfaced markets whose entry slippage ran to thousands of basis points.
+    This asks the book instead.
+
+    One request per candidate, so the field is narrowed first --
+    LIQUIDITY_SHORTLIST caps how many get measured. Set it to None to measure
+    every candidate at the cost of a much longer startup.
+    """
+    shortlist = candidates
+    if LIQUIDITY_SHORTLIST:
+        shortlist = sorted(candidates, key=lambda c: c["cohort_value_usd"],
+                           reverse=True)[:LIQUIDITY_SHORTLIST]
+
+    log.info("Measuring book depth on %d candidates (within %.0f bps of mid)\u2026",
+             len(shortlist), LIQUIDITY_BAND_BPS)
+
+    liquid: list[dict] = []
+    no_book = too_thin = 0
+    consecutive_failures = 0
+
+    for i, candidate in enumerate(shortlist, 1):
+        if i % 50 == 0:
+            log.info("  \u2026%d/%d measured, %d tradeable so far",
+                     i, len(shortlist), len(liquid))
+
+        book = books.fetch_order_book(candidate["token_id"], api_get)
+        if book is None:
+            # Could not read the book, so tradability is unproven. Not traded.
+            no_book += 1
+            consecutive_failures += 1
+            if consecutive_failures >= LIQUIDITY_ABORT_AFTER:
+                log.error("%d book fetches failed back to back - the API "
+                          "looks unreachable. Abandoning depth measurement.",
+                          consecutive_failures)
+                return []
+            continue
+        consecutive_failures = 0
+
+        depth = books.tradeable_depth(book, LIQUIDITY_BAND_BPS)
+        if depth < MIN_TRADEABLE_DEPTH_USD:
+            too_thin += 1
+            continue
+
+        candidate["depth_usd"] = depth
+        candidate["spread_bps"] = books.spread_bps(book) or 0.0
+        liquid.append(candidate)
+
+    log.info("Tradeable: %d of %d  (dropped %d unreadable, %d thinner than $%s)",
+             len(liquid), len(shortlist), no_book, too_thin,
+             "{:,.0f}".format(MIN_TRADEABLE_DEPTH_USD))
+    return liquid
+
+
 def _side_weight(candidate: dict) -> tuple[float, int]:
     """
     How much the cohort has behind one side: money first, head count second.
@@ -733,16 +812,17 @@ def _pick_side(group: list[dict]) -> dict | None:
     return None
 
 
-def load_candidates() -> list[dict]:
+def load_candidates(measure_liquidity: bool = True) -> list[dict]:
     """
-    Choose the book in one pass: rank the overlaps by the dollars the copied
-    traders have committed, keep the top TOP_BY_VALUE, then open the
-    TRADE_SOONEST of those that resolve first.
+    Choose the book in one pass: measure real order-book depth, keep the
+    TOP_BY_LIQUIDITY deepest, then open the TRADE_SOONEST of those that
+    resolve first.
 
-    Ranking on total_value rather than share count is deliberate. A sub-cent
-    market routinely shows half a million shares for a couple of hundred
-    dollars, and ranking by size would let those crowd out every position with
-    real money behind it.
+    Cohort money still narrows the field before the books are read -- see
+    _measure_liquidity -- but it no longer decides the ranking. What the
+    copied traders staked and what you can actually fill are different
+    questions, and only the second one determines whether a trade survives
+    contact with the order book.
     """
     for path in (TOP_TRADERS_FILE, OVERLAPS_FILE):
         if not path.exists():
@@ -855,14 +935,34 @@ def load_candidates() -> list[dict]:
                  contested, contested - deadlocked, deadlocked,
                  "{:,.0f}".format(SPLIT_DECISIVE_MARGIN_USD))
 
-    by_value = sorted(best_side.values(), key=lambda c: c["cohort_value_usd"],
-                      reverse=True)[:TOP_BY_VALUE]
-    chosen = sorted(by_value, key=lambda c: c["end_date"])[:TRADE_SOONEST]
+    survivors = list(best_side.values())
+    if measure_liquidity:
+        measured = _measure_liquidity(survivors)
+        if measured:
+            survivors = measured
+        else:
+            # Depth could not be established for anything. Fall back to
+            # cohort money so the run is not dead in the water, but say so
+            # plainly: this is the blind ranking the depth pass replaces.
+            log.warning("No depth data - falling back to ranking on cohort "
+                        "money. Selection is NOT liquidity-aware this run.")
+            for candidate in survivors:
+                candidate.setdefault("depth_usd", candidate["cohort_value_usd"])
+                candidate.setdefault("spread_bps", 0.0)
+    else:
+        # Dry run: no network, so depth is unknown and cohort money stands in.
+        for candidate in survivors:
+            candidate.setdefault("depth_usd", candidate["cohort_value_usd"])
+            candidate.setdefault("spread_bps", 0.0)
 
-    if by_value:
-        log.info("Top %d by cohort money: $%s at the top, $%s at the cut",
-                 len(by_value), "{:,.0f}".format(by_value[0]["cohort_value_usd"]),
-                 "{:,.0f}".format(by_value[-1]["cohort_value_usd"]))
+    deepest = sorted(survivors, key=lambda c: c["depth_usd"],
+                     reverse=True)[:TOP_BY_LIQUIDITY]
+    chosen = sorted(deepest, key=lambda c: c["end_date"])[:TRADE_SOONEST]
+
+    if deepest:
+        log.info("Top %d by book depth: $%s at the top, $%s at the cut",
+                 len(deepest), "{:,.0f}".format(deepest[0]["depth_usd"]),
+                 "{:,.0f}".format(deepest[-1]["depth_usd"]))
 
     # Equal weight: nothing is opened after seeding, so there is no reason to
     # hold anything back beyond the standing cash reserve.
@@ -874,10 +974,10 @@ def load_candidates() -> list[dict]:
     log.info("Trading the %d resolving soonest, $%s each:",
              len(chosen), "{:,.2f}".format(per_trade))
     for i, c in enumerate(chosen, 1):
-        log.info("  %2d. %-42s %-14s %4dd  $%-12s %d traders", i,
-                 c["market_title"][:42], c["outcome_to_buy"][:14],
-                 c["days_to_expiry"], "{:,.0f}".format(c["cohort_value_usd"]),
-                 c["conviction_score"])
+        log.info("  %2d. %-40s %-12s %4dd  depth $%-10s spread %4.0fbps  %d traders",
+                 i, c["market_title"][:40], c["outcome_to_buy"][:12],
+                 c["days_to_expiry"], "{:,.0f}".format(c["depth_usd"]),
+                 c["spread_bps"], c["conviction_score"])
 
     return chosen
 
@@ -1631,9 +1731,11 @@ def run() -> None:
     portfolio = None if args.reset else Portfolio.load()
     if portfolio is None:
         log.info("Selecting the book: top %d by cohort money, "
-                 "then the %d resolving soonest…", TOP_BY_VALUE, TRADE_SOONEST)
+                 "then the %d resolving soonest…", TOP_BY_LIQUIDITY, TRADE_SOONEST)
         portfolio = Portfolio()
-        seed_positions(portfolio, load_candidates(), args.dry_run)
+        seed_positions(portfolio,
+                       load_candidates(measure_liquidity=not args.dry_run),
+                       args.dry_run)
         portfolio.save()
     else:
         log.info("Resumed existing portfolio — %d open, %d closed, $%s cash, started %s",
