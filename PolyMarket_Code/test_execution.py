@@ -258,6 +258,43 @@ def test_flat_fee_can_be_switched_off() -> None:
         pt.FLAT_FEE_PCT = original
 
 
+def _side(value: float, traders: int, outcome: str = "Yes") -> dict:
+    return {"cohort_value_usd": value, "conviction_score": traders,
+            "outcome_to_buy": outcome, "market_title": "M"}
+
+
+def test_split_market_follows_the_money() -> None:
+    print("\nsplit market: the heavier side wins")
+    yes, no = _side(89_745, 6, "Yes"), _side(17_687, 5, "No")
+    check("picks the bigger stake", pt._pick_side([no, yes])["outcome_to_buy"], "Yes")
+    # Money outranks head count, even when the lighter side has more traders.
+    rich_few, poor_many = _side(470_635, 4, "No"), _side(16_535, 5, "Yes")
+    check("money beats head count",
+          pt._pick_side([poor_many, rich_few])["outcome_to_buy"], "No")
+
+
+def test_split_market_breaks_ties_on_traders() -> None:
+    print("\nsplit market: equal money, more traders wins")
+    a, b = _side(12_138, 4, "Yes"), _side(12_138, 6, "No")
+    check("head count breaks the tie", pt._pick_side([a, b])["outcome_to_buy"], "No")
+
+
+def test_dead_heat_buys_nothing() -> None:
+    print("\ndead heat: buy neither side")
+    a, b = _side(5_000, 4, "Yes"), _side(5_000, 4, "No")
+    check("level on both -> None", pt._pick_side([a, b]), None)
+    # A third, weaker outcome must not rescue a deadlocked top two.
+    c = _side(10, 1, "Maybe")
+    check("still None with a third side", pt._pick_side([a, b, c]), None)
+
+
+def test_uncontested_market_passes_through() -> None:
+    print("\nuncontested market: taken as-is")
+    only = _side(1_000, 3, "Yes")
+    check("single side returned", pt._pick_side([only])["outcome_to_buy"], "Yes")
+    check("empty group -> None", pt._pick_side([]), None)
+
+
 def main() -> int:
     print("=" * 72)
     print("  EXECUTION COST TESTS  (synthetic books, no network)")
@@ -270,7 +307,11 @@ def main() -> int:
                test_partial_exit_keeps_the_remainder, test_no_bid_means_no_exit,
                test_old_portfolio_still_loads,
                test_flat_fee_both_legs,
-               test_flat_fee_can_be_switched_off):
+               test_flat_fee_can_be_switched_off,
+               test_split_market_follows_the_money,
+               test_split_market_breaks_ties_on_traders,
+               test_dead_heat_buys_nothing,
+               test_uncontested_market_passes_through):
         fn()
 
     print("\n" + "=" * 72)

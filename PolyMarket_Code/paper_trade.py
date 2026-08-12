@@ -688,6 +688,40 @@ def _as_money(value: Any) -> float:
         return 0.0
 
 
+def _side_weight(candidate: dict) -> tuple[float, int]:
+    """
+    How much the cohort has behind one side: money first, head count second.
+
+    conviction_score is the surviving cohort size, i.e. the trader count.
+    """
+    return (candidate["cohort_value_usd"], candidate["conviction_score"])
+
+
+def _pick_side(group: list[dict]) -> dict | None:
+    """
+    Choose which side of a market to trade, or None to trade none of it.
+
+    The overlaps file lists each outcome separately, so a market the cohort is
+    split on appears more than once. Buying both Over at 0.62 and Under at 0.38
+    pays $1.00 for $1.00 back, minus two spreads and two fees -- and since
+    open_positions is keyed by condition_id the second fill would overwrite the
+    first, leaving cash gone twice and one position tracked.
+
+    Follow the weight of money first and the head count second. When the top
+    two are level on both, the cohort has expressed no view on direction, so
+    None is returned and the market is skipped rather than guessed at.
+    """
+    if not group:
+        return None
+    if len(group) == 1:
+        return group[0]
+
+    ranked = sorted(group, key=_side_weight, reverse=True)
+    if _side_weight(ranked[0]) == _side_weight(ranked[1]):
+        return None
+    return ranked[0]
+
+
 def load_candidates() -> list[dict]:
     """
     Choose the book in one pass: rank the overlaps by the dollars the copied
@@ -760,22 +794,51 @@ def load_candidates() -> list[dict]:
              len(overlaps.get("overlaps", [])), len(pool), dropped["under_way"],
              dropped["no_end_date"], dropped["no_token"], dropped["no_cohort"])
 
-    # One side per market. The overlaps file lists each outcome separately, so
-    # a market where the cohort is split shows up twice -- and buying both Over
-    # at 0.62 and Under at 0.38 pays $1.00 for $1.00 back, minus two spreads and
-    # two fees. Worse, open_positions is keyed by condition_id, so the second
-    # fill would overwrite the first: cash gone twice, one position tracked.
-    # Keep whichever side the cohort has more money on.
-    best_side: dict[str, dict] = {}
+    # One side per market, or none at all. The overlaps file lists each outcome
+    # separately, so a market the cohort is split on shows up twice -- and
+    # buying both Over at 0.62 and Under at 0.38 pays $1.00 for $1.00 back,
+    # minus two spreads and two fees. Worse, open_positions is keyed by
+    # condition_id, so the second fill would overwrite the first: cash gone
+    # twice, one position tracked.
+    #
+    # When the cohort is split, follow the weight of money first and the head
+    # count second. If both are level the cohort has expressed no view on which
+    # way to lean, so the market is dropped rather than guessed at.
+    sides: dict[str, list[dict]] = {}
     for candidate in pool:
-        cid = candidate["condition_id"]
-        incumbent = best_side.get(cid)
-        if incumbent is None or candidate["cohort_value_usd"] > incumbent["cohort_value_usd"]:
-            best_side[cid] = candidate
-    contested = len(pool) - len(best_side)
+        sides.setdefault(candidate["condition_id"], []).append(candidate)
+
+    best_side: dict[str, dict] = {}
+    contested = deadlocked = 0
+
+    for cid, group in sides.items():
+        if len(group) == 1:
+            best_side[cid] = group[0]
+            continue
+
+        contested += 1
+        ranked = sorted(group, key=_side_weight, reverse=True)
+        top, runner_up = ranked[0], ranked[1]
+
+        if _pick_side(group) is None:
+            deadlocked += 1
+            log.info("  SPLIT  %-42s dead heat, %d traders and $%s a side - skipped",
+                     top["market_title"][:42], top["conviction_score"],
+                     "{:,.0f}".format(top["cohort_value_usd"]))
+            continue
+
+        best_side[cid] = top
+        log.info("  SPLIT  %-42s %-12s over %-12s  $%s v $%s, %d v %d traders",
+                 top["market_title"][:42], top["outcome_to_buy"][:12],
+                 runner_up["outcome_to_buy"][:12],
+                 "{:,.0f}".format(top["cohort_value_usd"]),
+                 "{:,.0f}".format(runner_up["cohort_value_usd"]),
+                 top["conviction_score"], runner_up["conviction_score"])
+
     if contested:
-        log.info("Dropped %d opposing side(s) - the cohort is split on those markets.",
-                 contested)
+        log.info("Cohort split on %d market(s): kept the heavier side on %d, "
+                 "dropped %d as a dead heat.",
+                 contested, contested - deadlocked, deadlocked)
 
     by_value = sorted(best_side.values(), key=lambda c: c["cohort_value_usd"],
                       reverse=True)[:TOP_BY_VALUE]
