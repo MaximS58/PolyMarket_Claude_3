@@ -78,6 +78,13 @@ TOP_BY_VALUE = 25
 TRADE_SOONEST = 10
 SELECTION_LABEL = "top-value/soonest"
 
+# When the cohort is split across both sides of a market, one side has to be
+# ahead by more than this in committed dollars for the split to count as a
+# signal. Anything closer is treated as no view at all and the market is
+# dropped. Note this is an absolute figure, so a contested market whose whole
+# cohort is smaller than this can never clear it, however lopsided the split.
+SPLIT_DECISIVE_MARGIN_USD = 20_000.0
+
 # Live dashboard
 RECENT_ACTIVITY_LINES = 8   # log lines shown at the bottom of the frame
 DASHBOARD_MIN_WIDTH = 72    # below this the table is unreadable anyway
@@ -707,9 +714,10 @@ def _pick_side(group: list[dict]) -> dict | None:
     open_positions is keyed by condition_id the second fill would overwrite the
     first, leaving cash gone twice and one position tracked.
 
-    Follow the weight of money first and the head count second. When the top
-    two are level on both, the cohort has expressed no view on direction, so
-    None is returned and the market is skipped rather than guessed at.
+    A side is only taken when it is ahead by more than
+    SPLIT_DECISIVE_MARGIN_USD in committed dollars. A narrower gap is not a
+    view on direction, it is noise, so None is returned and the market is
+    skipped rather than guessed at.
     """
     if not group:
         return None
@@ -717,9 +725,12 @@ def _pick_side(group: list[dict]) -> dict | None:
         return group[0]
 
     ranked = sorted(group, key=_side_weight, reverse=True)
-    if _side_weight(ranked[0]) == _side_weight(ranked[1]):
-        return None
-    return ranked[0]
+    top, runner_up = ranked[0], ranked[1]
+
+    margin = top["cohort_value_usd"] - runner_up["cohort_value_usd"]
+    if margin > SPLIT_DECISIVE_MARGIN_USD:
+        return top
+    return None
 
 
 def load_candidates() -> list[dict]:
@@ -822,9 +833,12 @@ def load_candidates() -> list[dict]:
 
         if _pick_side(group) is None:
             deadlocked += 1
-            log.info("  SPLIT  %-42s dead heat, %d traders and $%s a side - skipped",
-                     top["market_title"][:42], top["conviction_score"],
-                     "{:,.0f}".format(top["cohort_value_usd"]))
+            log.info("  SPLIT  %-42s too close: $%s v $%s (gap $%s) - skipped",
+                     top["market_title"][:42],
+                     "{:,.0f}".format(top["cohort_value_usd"]),
+                     "{:,.0f}".format(runner_up["cohort_value_usd"]),
+                     "{:,.0f}".format(top["cohort_value_usd"]
+                                      - runner_up["cohort_value_usd"]))
             continue
 
         best_side[cid] = top
@@ -836,9 +850,10 @@ def load_candidates() -> list[dict]:
                  top["conviction_score"], runner_up["conviction_score"])
 
     if contested:
-        log.info("Cohort split on %d market(s): kept the heavier side on %d, "
-                 "dropped %d as a dead heat.",
-                 contested, contested - deadlocked, deadlocked)
+        log.info("Cohort split on %d market(s): kept %d with a decisive margin, "
+                 "dropped %d as too close to call (< $%s).",
+                 contested, contested - deadlocked, deadlocked,
+                 "{:,.0f}".format(SPLIT_DECISIVE_MARGIN_USD))
 
     by_value = sorted(best_side.values(), key=lambda c: c["cohort_value_usd"],
                       reverse=True)[:TOP_BY_VALUE]

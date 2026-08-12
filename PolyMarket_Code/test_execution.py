@@ -273,10 +273,18 @@ def test_split_market_follows_the_money() -> None:
           pt._pick_side([poor_many, rich_few])["outcome_to_buy"], "No")
 
 
-def test_split_market_breaks_ties_on_traders() -> None:
-    print("\nsplit market: equal money, more traders wins")
-    a, b = _side(12_138, 4, "Yes"), _side(12_138, 6, "No")
-    check("head count breaks the tie", pt._pick_side([a, b])["outcome_to_buy"], "No")
+def test_narrow_margin_buys_nothing() -> None:
+    print("\nnarrow margin: ahead, but not by enough")
+    m = pt.SPLIT_DECISIVE_MARGIN_USD
+    a, b = _side(30_000, 4, "Yes"), _side(30_000 - m + 1, 4, "No")
+    check("gap just under the margin -> None", pt._pick_side([a, b]), None)
+    # Exactly the margin is not "more than" the margin.
+    a, b = _side(30_000, 4, "Yes"), _side(30_000 - m, 9, "No")
+    check("gap exactly the margin -> None", pt._pick_side([a, b]), None)
+    # One dollar past it is decisive.
+    a, b = _side(30_000, 4, "Yes"), _side(30_000 - m - 1, 9, "No")
+    check("one dollar past -> takes it",
+          pt._pick_side([a, b])["outcome_to_buy"], "Yes")
 
 
 def test_dead_heat_buys_nothing() -> None:
@@ -286,6 +294,9 @@ def test_dead_heat_buys_nothing() -> None:
     # A third, weaker outcome must not rescue a deadlocked top two.
     c = _side(10, 1, "Maybe")
     check("still None with a third side", pt._pick_side([a, b, c]), None)
+    # A head-count landslide must not rescue a one-dollar money gap.
+    a, b = _side(5_000, 2, "Yes"), _side(4_999, 40, "No")
+    check("traders cannot rescue a thin gap", pt._pick_side([a, b]), None)
 
 
 def test_uncontested_market_passes_through() -> None:
@@ -309,7 +320,7 @@ def main() -> int:
                test_flat_fee_both_legs,
                test_flat_fee_can_be_switched_off,
                test_split_market_follows_the_money,
-               test_split_market_breaks_ties_on_traders,
+               test_narrow_margin_buys_nothing,
                test_dead_heat_buys_nothing,
                test_uncontested_market_passes_through):
         fn()
